@@ -22,6 +22,11 @@ Phần chatbot chỉ mới nhắn tin qua lại, cần cải tiến thêm(nếu 
 
 ```
 Nếu chọn vị trí/nhập vị trí bị lỗi thì đợi khoảng 1 phút rồi thử lại.
+
+```
+
+Key API để test: fdcea49178237153de98821d877265b20649dadd015fddac5a28c2482873a7d3
+
 ```
 
 ## 1. Cài đặt
