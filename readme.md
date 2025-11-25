@@ -17,10 +17,7 @@ cho mình một Key riêng, sau khi hoàn thiện tất cả thì sẽ gán cố
 Tạo Key tại https://serpapi.com
 
 ```
-Phần chatbot chỉ mới nhắn tin qua lại, cần cải tiến thêm(nếu cần).
-```
 
-```
 Nếu chọn vị trí/nhập vị trí bị lỗi thì đợi khoảng 1 phút rồi thử lại.
 
 ```

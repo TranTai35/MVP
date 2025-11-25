@@ -23,7 +23,7 @@ except Exception:
 # =======================
 st.set_page_config(page_title="Smart Tourism System — v3", layout="wide")
 
-DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://zntxx-34-74-221-120.a.free.pinggy.link")
+DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://gbqbp-35-221-206-12.a.free.pinggy.link")
 NOMINATIM = "https://nominatim.openstreetmap.org"
 OSRM = "https://router.project-osrm.org"
 
