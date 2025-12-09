@@ -23,13 +23,13 @@ except Exception:
 # =======================
 st.set_page_config(page_title="Smart Tourism System ", layout="wide")
 
-DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://hmfpy-35-196-113-217.a.free.pinggy.link")
+DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://ukpof-34-187-181-147.a.free.pinggy.link")
 NOMINATIM = "https://nominatim.openstreetmap.org"
 OSRM = "https://router.project-osrm.org"
 
 # SerpAPI cho Google Maps search
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
-DEFAULT_SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
+DEFAULT_SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "fdcea49178237153de98821d877265b20649dadd015fddac5a28c2482873a7d3")
 
 UA = {
     "User-Agent": "SmartTourism/1.0",
@@ -341,12 +341,13 @@ def auto_generate_schedule_variants(
     ollama_base: str,
     model: str,
 ) -> Tuple[List[List[Dict]], str]:
-    """Auto-generate up to 3 schedule variants based on preferences.
+    """Auto-generate đến 3 lịch trình theo sở thích.
 
-    - Số khung giờ = số sở thích (>=1).
-    - Nếu có nhiều sở thích thuộc nhóm ăn uống ("ăn", "ăn sáng", "ăn trưa", "ăn tối", "cơm", "phở", "bún", "cafe", "cà phê"),
-      chúng phải cách nhau tối thiểu 4 tiếng. Nếu không đủ thời gian, sẽ báo lỗi.
-    - Sinh 3 biến thể, cố gắng tối ưu rating, khoảng cách, và hạn chế trùng >3 địa điểm giữa các lịch trình.
+    - Mỗi sở thích = 1 khung giờ.
+    - SerpAPI: lấy ứng viên cho từng sở thích; Ollama chọn điểm phù hợp nhất (tránh trùng lặp trong lịch).
+    - Sinh 3 biến thể: mixed, ưu tiên rating, ưu tiên quãng đường.
+    - Các lịch sau chỉ trùng tối đa 2 địa điểm với lịch trước.
+    - Các mục ăn/uống cách nhau tối thiểu 4 tiếng.
     """
     t0 = datetime.strptime(start_time_str, "%H:%M")
     t1 = datetime.strptime(end_time_str, "%H:%M")
@@ -377,10 +378,7 @@ def auto_generate_schedule_variants(
         tokens = [t for t in pref_l.replace(",", " ").split() if len(t) >= 3]
         return any(t in text for t in tokens)
 
-    # Gather candidates from all preferences
-    candidates = []
-    seen = set()
-    for pref in preferences or [""]:
+    def fetch_pref_candidates(pref: str) -> List[Dict]:
         try:
             main_cat = "Ăn uống" if is_food_pref(pref) else "Vui chơi"
             detail = {"cuisine": pref}
@@ -397,41 +395,82 @@ def auto_generate_schedule_variants(
             )
         except Exception:
             res = []
-
         filtered = [r for r in res if matches_pref(r, pref)]
-        use_list = filtered if filtered else res
+        return filtered if filtered else res
 
-        for r in use_list:
-            key = (r.get("name"), float(r.get("lat", 0)), float(r.get("lon", 0)))
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(r)
+    def choose_with_ollama(pref: str, cands: List[Dict], used_names: set) -> Optional[Dict]:
+        short = cands[:5]
+        if not short:
+            return None
+        short = [c for c in short if c.get("name") not in used_names] or short
 
-    if len(candidates) < block_count:
-        raise ValueError(f"Chỉ tìm thấy {len(candidates)} địa điểm, cần ít nhất {block_count} để tạo lịch tự động.")
+        options_text = "\n".join(
+            [
+                f"{i+1}. {c.get('name','(không tên)')} — {c.get('address','')} — rating {c.get('rating','?')}"
+                for i, c in enumerate(short)
+            ]
+        )
+        prompt = (
+            "Bạn là trợ lý du lịch. Chọn duy nhất 1 địa điểm phù hợp nhất với sở thích sau, ưu tiên đúng sở thích, rating cao, gần trung tâm.\n"
+            f"Sở thích: {pref}\n"
+            "Danh sách ứng viên:\n"
+            f"{options_text}\n"
+            "Chỉ trả về số thứ tự (ví dụ: 2)."
+        )
+        try:
+            resp = ollama_chat([
+                {"role": "system", "content": "Bạn là trợ lý du lịch, trả lời cực ngắn."},
+                {"role": "user", "content": prompt},
+            ], ollama_base, model)
+            import re
+            m = re.search(r"(\d+)", resp)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(short):
+                    return short[idx]
+        except Exception:
+            pass
+        for c in short:
+            if c.get("name") not in used_names:
+                return c
+        return short[0]
 
-    # Sort by different criteria
-    by_rating = sorted([c for c in candidates if c.get("rating") is not None], 
-                        key=lambda x: (-(x.get("rating") or 0), -(x.get("reviews") or 0)))
-    by_distance = sorted(candidates, key=lambda x: x.get("distance_km", 9999))
-
-    # Build up to 3 variants while limiting overlap (<=3 địa điểm trùng)
-    def build_schedule(chosen_places: List[Dict]) -> List[Dict]:
-        schedule = []
+    def build_schedule(strategy_config) -> List[Dict]:
+        """
+        strategy_config: str hoặc list
+        - str "rating": toàn bộ ưu tiên đánh giá
+        - str "distance": toàn bộ ưu tiên quãng đường
+        - list (e.g. ["rating", "distance"]): áp dụng rating cho nửa đầu, distance cho nửa sau
+        """
+        schedule: List[Dict] = []
         current_start = t0
         last_eat_time = None
-        eat_keywords = ["ăn", "cơm", "cơm tấm", "phở", "bún", "bánh", "cafe", "cà phê", "ăn sáng", "ăn trưa", "ăn tối", "nhậu", "lẩu", "buffet"]
+        used_names = set()
 
-        for i, place in enumerate(chosen_places):
-            pref_goal = pref_list[i] if i < len(pref_list) else "Khám phá"
-            is_eat = any(k.lower() in pref_goal.lower() for k in eat_keywords)
+        for idx, pref_goal in enumerate(pref_list):
+            cands = fetch_pref_candidates(pref_goal)
+            if not cands:
+                raise ValueError(f"Không tìm thấy địa điểm cho sở thích: {pref_goal}")
 
-            # Ensure 4h gap between eating preferences
+            if isinstance(strategy_config, list):
+                mid = len(pref_list) // 2
+                strategy = strategy_config[0] if idx < mid else strategy_config[1]
+            else:
+                strategy = strategy_config
+
+            if strategy == "rating":
+                cands = sorted(cands, key=lambda x: (-(x.get("rating") or 0), -(x.get("reviews") or 0)))
+            elif strategy == "distance":
+                cands = sorted(cands, key=lambda x: x.get("distance_km", 9999))
+
+            place = choose_with_ollama(pref_goal, cands, used_names)
+            if not place:
+                raise ValueError(f"Không chọn được địa điểm cho: {pref_goal}")
+
+            is_eat = is_food_pref(pref_goal)
             if is_eat and last_eat_time is not None:
                 gap = (current_start - last_eat_time).total_seconds() / 3600.0
                 if gap < 4:
-                    # shift start to maintain 4h gap
                     delta = timedelta(hours=4 - gap)
                     current_start = current_start + delta
 
@@ -446,65 +485,31 @@ def auto_generate_schedule_variants(
                 "place": place,
             })
 
+            used_names.add(place.get("name"))
             if is_eat:
                 last_eat_time = current_start
             current_start = end_time
 
         return schedule
 
-    # helper to limit overlap with existing variants
-    def too_much_overlap(new_places: List[Dict], built_sets: List[set]) -> bool:
-        new_keys = {(p.get("name"), p.get("lat"), p.get("lon")) for p in new_places}
-        for keys in built_sets:
-            if len(new_keys & keys) > 3:
-                return True
-        return False
-
-    # Candidate orderings for variants
-    candidates_variants: List[List[Dict]] = []
-    if by_rating:
-        candidates_variants.append(by_rating[:block_count])
-    if by_distance:
-        candidates_variants.append(by_distance[:block_count])
-    # mixed: interleave rating and distance
-    mixed = []
-    max_len = max(len(by_rating), len(by_distance))
-    for i in range(max_len):
-        if i < len(by_rating):
-            mixed.append(by_rating[i])
-        if len(mixed) >= block_count:
-            break
-        if i < len(by_distance):
-            mixed.append(by_distance[i])
-        if len(mixed) >= block_count:
-            break
-    if mixed:
-        candidates_variants.append(mixed[:block_count])
-
     schedules: List[List[Dict]] = []
-    schedule_place_sets: List[set] = []
-    for cand in candidates_variants:
-        if len(cand) < block_count:
-            continue
-        if too_much_overlap(cand, schedule_place_sets):
-            continue
+
+    for strategy in [["rating", "distance"], "rating", "distance"]:
         try:
-            sched = build_schedule(cand[:block_count])
-            place_keys = {(p.get("name"), p.get("lat"), p.get("lon")) for p in cand[:block_count]}
+            sched = build_schedule(strategy)
             schedules.append(sched)
-            schedule_place_sets.append(place_keys)
         except Exception:
             continue
-        if len(schedules) >= 3:
-            break
 
-    # Ask Ollama for a short note
+    if not schedules:
+        raise ValueError("Không tạo được lịch trình nào. Hãy thử nới thời gian hoặc giảm số sở thích.")
+
     try:
-        places_text = "; ".join([f"{p['name']}" for p in candidates[:9]])
+        places_text = "; ".join([f"{b['place'].get('name','')}" for b in schedules[0]])
         system = {"role": "system", "content": "Bạn là trợ lý lập kế hoạch du lịch ngắn gọn bằng tiếng Việt."}
         user_msg = {
             "role": "user",
-            "content": f"Tóm tắt ngắn gọn (2-3 câu) về các địa điểm này để tạo 3 lịch trình khác nhau: {places_text}",
+            "content": f"Tóm tắt ngắn gọn (2-3 câu) về lịch trình này: {places_text}",
         }
         note = ollama_chat([system, user_msg], ollama_base, model)
     except Exception:
@@ -649,8 +654,10 @@ st.session_state["itin_name"] = itin_name
 # Mode selector
 mode = st.radio("Chế độ tạo lịch", ["Nhập từng cái", "Tự động tạo lịch"], horizontal=True)
 
-# Reset schedule when switching to auto mode so timeline starts empty
+# Reset schedule when switching modes so timeline starts empty
 if mode == "Tự động tạo lịch" and st.session_state.get("schedule_mode") != "Tự động tạo lịch":
+    st.session_state["schedule"] = []
+elif mode == "Nhập từng cái" and st.session_state.get("schedule_mode") != "Nhập từng cái":
     st.session_state["schedule"] = []
 
 st.session_state["schedule_mode"] = mode
@@ -701,53 +708,10 @@ if mode == "Nhập từng cái":
                 end_time.strftime("%H:%M"),
                 goal,
             )
-    
-    # Map picker for last block
-    if st.session_state["schedule"]:
-        st.markdown("**Chọn vị trí cho khung giờ (tùy chọn)**")
-        last_block = st.session_state["schedule"][-1]
-        with st.expander(f"Chọn vị trí cho khung giờ cuối ({last_block['start']}–{last_block['end']})"):
-            default_center = st.session_state.get("search_center", st.session_state.get("origin", {}))
-            m = folium.Map(
-                location=[default_center.get("lat", 21.0278), default_center.get("lon", 105.8342)],
-                zoom_start=13
-            )
-            map_state = st_folium(m, height=300, returned_objects=["last_clicked", "center"])
-            addr_input = st.text_input("Hoặc nhập địa chỉ", value="", key="manual_addr")
-            
-            if st.button("Lấy vị trí cho khung giờ", key="btn_get_loc_manual"):
-                lat = lon = None
-                if map_state and map_state.get("last_clicked"):
-                    lat = map_state["last_clicked"]["lat"]
-                    lon = map_state["last_clicked"]["lng"]
-                elif addr_input:
-                    try:
-                        lat, lon, disp = geocode(addr_input)
-                    except Exception as e:
-                        st.error(str(e))
-                        lat = lon = None
-                
-                if lat and lon:
-                    try:
-                        disp = reverse_geocode(lat, lon)
-                    except Exception:
-                        disp = f"{lat:.5f},{lon:.5f}"
-                    
-                    last_block["place"] = {
-                        "lat": lat,
-                        "lon": lon,
-                        "name": disp,
-                        "address": disp,
-                        "rating": None,
-                        "reviews": None,
-                        "distance_km": 0,
-                        "price": None,
-                    }
-                    st.success(f"Đã đặt vị trí: {disp}")
 
 else:
     # Auto mode: time range + preferences
-    st.markdown("Tự động tạo 3 lịch trình: chọn khoảng thời gian và các sở thích")
+    st.markdown("Tự động tạo lịch: SerpAPI tìm địa điểm, Ollama chọn phù hợp nhất cho từng sở thích")
     auto_start = st.time_input("Bắt đầu", datetime.strptime("9:00", "%H:%M").time(), key="auto_start_main")
     auto_end = st.time_input("Kết thúc", datetime.strptime("12:00", "%H:%M").time(), key="auto_end_main")
     
@@ -772,12 +736,12 @@ else:
         st.rerun()
     
     # Generate button
-    if st.button("🚀 Tạo 3 lịch trình tự động", key="btn_generate"):
+    if st.button("🚀 Tạo lịch tự động", key="btn_generate"):
         prefs = [v.strip() for v in pref_inputs if v and v.strip()]
         if not prefs:
             st.warning("Vui lòng nhập ít nhất một sở thích.")
         else:
-            with st.spinner("Đang tạo 3 lịch trình..."):
+            with st.spinner("Đang tạo lịch tự động..."):
                 try:
                     origin = st.session_state.get("origin", {})
                     center = st.session_state.get("search_center", origin)
@@ -797,10 +761,10 @@ else:
                 except Exception as e:
                     st.error(str(e))
     
-    # Display 3 variants
+    # Display generated schedule(s)
     if st.session_state.get("_auto_schedules"):
         st.divider()
-        st.markdown("### 3 Lịch trình được tạo")
+        st.markdown("### Lịch trình được tạo")
         
         schedules = st.session_state["_auto_schedules"]
         
@@ -875,7 +839,7 @@ else:
                                 icon=stop_icon,
                             ).add_to(m_auto)
                     
-                    st_folium(m_auto, height=400)
+                    st_folium(m_auto, height=400, key=f"map_auto_{idx}")
             
             # Select button
             if st.button(f"✅ Chọn lịch trình #{idx}", key=f"select_auto_{idx}"):
@@ -1063,6 +1027,7 @@ if "saved_itineraries" not in st.session_state:
 st.subheader("💾 Lưu Lịch Trình")
 
 if st.button("Lưu lịch trình"):
+    origin = st.session_state.get("origin")
     if origin and st.session_state["schedule"]:
         st.session_state["saved_itineraries"].append(
             {
