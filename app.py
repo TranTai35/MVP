@@ -3,7 +3,7 @@ import time
 import json
 import requests
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 from streamlit_folium import st_folium
 import folium
@@ -21,9 +21,9 @@ except Exception:
 # =======================
 # Cấu hình chung
 # =======================
-st.set_page_config(page_title="Smart Tourism System — v3", layout="wide")
+st.set_page_config(page_title="Smart Tourism System ", layout="wide")
 
-DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://gbqbp-35-221-206-12.a.free.pinggy.link")
+DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://hmfpy-35-196-113-217.a.free.pinggy.link")
 NOMINATIM = "https://nominatim.openstreetmap.org"
 OSRM = "https://router.project-osrm.org"
 
@@ -329,10 +329,193 @@ def sanitize_assistant_text(text: str) -> str:
     # Replace the special header token with a friendly Vietnamese label
     return text.replace("<|start_header_id|>assistant<|end_header_id|>", "Chatbot trả lời")
 
+
+def auto_generate_schedule_variants(
+    start_time_str: str,
+    end_time_str: str,
+    preferences: List[str],
+    origin: Dict,
+    center: Dict,
+    radius_km: float,
+    serpapi_key: str,
+    ollama_base: str,
+    model: str,
+) -> Tuple[List[List[Dict]], str]:
+    """Auto-generate up to 3 schedule variants based on preferences.
+
+    - Số khung giờ = số sở thích (>=1).
+    - Nếu có nhiều sở thích thuộc nhóm ăn uống ("ăn", "ăn sáng", "ăn trưa", "ăn tối", "cơm", "phở", "bún", "cafe", "cà phê"),
+      chúng phải cách nhau tối thiểu 4 tiếng. Nếu không đủ thời gian, sẽ báo lỗi.
+    - Sinh 3 biến thể, cố gắng tối ưu rating, khoảng cách, và hạn chế trùng >3 địa điểm giữa các lịch trình.
+    """
+    t0 = datetime.strptime(start_time_str, "%H:%M")
+    t1 = datetime.strptime(end_time_str, "%H:%M")
+    if t1 <= t0:
+        t1 = t1.replace(day=t1.day + 1)
+
+    total_minutes = int((t1 - t0).total_seconds() / 60)
+    if total_minutes < 30:
+        raise ValueError("Khoảng thời gian quá ngắn để tự động tạo lịch.")
+
+    pref_list = preferences or ["Khám phá"]
+    block_count = max(1, len(pref_list))
+    block_minutes = max(30, total_minutes // block_count)
+
+    food_keywords = ["ăn", "cơm", "phở", "bún", "bánh", "cafe", "cà phê", "ăn sáng", "ăn trưa", "ăn tối", "nhậu", "lẩu", "buffet", "pizza", "sushi", "bánh mì", "cơm tấm"]
+
+    def is_food_pref(pref: str) -> bool:
+        pref_l = (pref or "").lower()
+        return any(k in pref_l for k in food_keywords)
+
+    def matches_pref(place: Dict, pref: str) -> bool:
+        if not pref:
+            return True
+        text = f"{place.get('name','')} {place.get('address','')}".lower()
+        pref_l = pref.lower().strip()
+        if pref_l and pref_l in text:
+            return True
+        tokens = [t for t in pref_l.replace(",", " ").split() if len(t) >= 3]
+        return any(t in text for t in tokens)
+
+    # Gather candidates from all preferences
+    candidates = []
+    seen = set()
+    for pref in preferences or [""]:
+        try:
+            main_cat = "Ăn uống" if is_food_pref(pref) else "Vui chơi"
+            detail = {"cuisine": pref}
+            res = search_places_serpapi(
+                center.get("lat", origin.get("lat")),
+                center.get("lon", origin.get("lon")),
+                radius_km,
+                main_cat,
+                detail,
+                serpapi_key,
+                min_rating=0.0,
+                min_reviews=0,
+                top_n=12,
+            )
+        except Exception:
+            res = []
+
+        filtered = [r for r in res if matches_pref(r, pref)]
+        use_list = filtered if filtered else res
+
+        for r in use_list:
+            key = (r.get("name"), float(r.get("lat", 0)), float(r.get("lon", 0)))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(r)
+
+    if len(candidates) < block_count:
+        raise ValueError(f"Chỉ tìm thấy {len(candidates)} địa điểm, cần ít nhất {block_count} để tạo lịch tự động.")
+
+    # Sort by different criteria
+    by_rating = sorted([c for c in candidates if c.get("rating") is not None], 
+                        key=lambda x: (-(x.get("rating") or 0), -(x.get("reviews") or 0)))
+    by_distance = sorted(candidates, key=lambda x: x.get("distance_km", 9999))
+
+    # Build up to 3 variants while limiting overlap (<=3 địa điểm trùng)
+    def build_schedule(chosen_places: List[Dict]) -> List[Dict]:
+        schedule = []
+        current_start = t0
+        last_eat_time = None
+        eat_keywords = ["ăn", "cơm", "cơm tấm", "phở", "bún", "bánh", "cafe", "cà phê", "ăn sáng", "ăn trưa", "ăn tối", "nhậu", "lẩu", "buffet"]
+
+        for i, place in enumerate(chosen_places):
+            pref_goal = pref_list[i] if i < len(pref_list) else "Khám phá"
+            is_eat = any(k.lower() in pref_goal.lower() for k in eat_keywords)
+
+            # Ensure 4h gap between eating preferences
+            if is_eat and last_eat_time is not None:
+                gap = (current_start - last_eat_time).total_seconds() / 3600.0
+                if gap < 4:
+                    # shift start to maintain 4h gap
+                    delta = timedelta(hours=4 - gap)
+                    current_start = current_start + delta
+
+            end_time = current_start + timedelta(minutes=block_minutes)
+            if end_time > t1:
+                raise ValueError("Không đủ thời gian để xếp các sở thích (yêu cầu giãn cách 4h cho ăn uống).")
+
+            schedule.append({
+                "start": current_start.strftime("%H:%M"),
+                "end": end_time.strftime("%H:%M"),
+                "goal": pref_goal,
+                "place": place,
+            })
+
+            if is_eat:
+                last_eat_time = current_start
+            current_start = end_time
+
+        return schedule
+
+    # helper to limit overlap with existing variants
+    def too_much_overlap(new_places: List[Dict], built_sets: List[set]) -> bool:
+        new_keys = {(p.get("name"), p.get("lat"), p.get("lon")) for p in new_places}
+        for keys in built_sets:
+            if len(new_keys & keys) > 3:
+                return True
+        return False
+
+    # Candidate orderings for variants
+    candidates_variants: List[List[Dict]] = []
+    if by_rating:
+        candidates_variants.append(by_rating[:block_count])
+    if by_distance:
+        candidates_variants.append(by_distance[:block_count])
+    # mixed: interleave rating and distance
+    mixed = []
+    max_len = max(len(by_rating), len(by_distance))
+    for i in range(max_len):
+        if i < len(by_rating):
+            mixed.append(by_rating[i])
+        if len(mixed) >= block_count:
+            break
+        if i < len(by_distance):
+            mixed.append(by_distance[i])
+        if len(mixed) >= block_count:
+            break
+    if mixed:
+        candidates_variants.append(mixed[:block_count])
+
+    schedules: List[List[Dict]] = []
+    schedule_place_sets: List[set] = []
+    for cand in candidates_variants:
+        if len(cand) < block_count:
+            continue
+        if too_much_overlap(cand, schedule_place_sets):
+            continue
+        try:
+            sched = build_schedule(cand[:block_count])
+            place_keys = {(p.get("name"), p.get("lat"), p.get("lon")) for p in cand[:block_count]}
+            schedules.append(sched)
+            schedule_place_sets.append(place_keys)
+        except Exception:
+            continue
+        if len(schedules) >= 3:
+            break
+
+    # Ask Ollama for a short note
+    try:
+        places_text = "; ".join([f"{p['name']}" for p in candidates[:9]])
+        system = {"role": "system", "content": "Bạn là trợ lý lập kế hoạch du lịch ngắn gọn bằng tiếng Việt."}
+        user_msg = {
+            "role": "user",
+            "content": f"Tóm tắt ngắn gọn (2-3 câu) về các địa điểm này để tạo 3 lịch trình khác nhau: {places_text}",
+        }
+        note = ollama_chat([system, user_msg], ollama_base, model)
+    except Exception:
+        note = ""
+
+    return schedules, note
+
 # =======================
 # UI CHÍNH
-# =======================
-st.title("🗺️ Smart Tourism System — v3 (SerpAPI + OSM + OSRM + Ollama)")
+# ======================="
+st.title("🗺️ Smart Tourism System")
 
 
 # -------- SIDEBAR --------
@@ -437,26 +620,14 @@ with st.sidebar:
     radius_km = st.slider("Bán kính tìm kiếm (km)", 1, 20, 10)
 
 
+    # Initialize session state for schedule mode
+    if "schedule_mode" not in st.session_state:
+        st.session_state["schedule_mode"] = "Nhập từng cái"
 
-    # ----- Bộ lọc SerpAPI -----
-    st.divider()
-    st.subheader("Nhập mong muốn của bạn!")
-    cuisine = st.text_input("", value="")
-    detail_filters = {"cuisine": cuisine.strip()}
-
-    min_rating = st.slider("Rating tối thiểu", 0.0, 5.0, 0.0, 0.1)
-    min_reviews = 0
-
-    # Price range slider (two handles). Values are in Vietnam Dong (₫).
-    # Single-row range slider: user drags two ends to select min and max price.
-    price_range = st.slider(
-        "Khoảng giá (₫)",
-        0,
-        2000000,
-        (0, 500000),
-        step=10000,
-    )
-    # Checkbox removed per request; keep flag defaulted to False
+    # Manual mode filters will be shown conditionally in the schedule section below
+    min_rating = 0.0
+    price_range = (0, 500000)
+    detail_filters = {"cuisine": ""}
     fetch_price_details = False
 
 
@@ -469,101 +640,319 @@ if "itin_name" not in st.session_state:
     st.session_state["itin_name"] = "Đi chơi sáng"
 if "schedule" not in st.session_state:
     st.session_state["schedule"] = []
+if "schedule_mode" not in st.session_state:
+    st.session_state["schedule_mode"] = "Nhập từng cái"
 
-colA, colB = st.columns([2, 1])
+itin_name = st.text_input("Tên lịch trình", value=st.session_state["itin_name"])
+st.session_state["itin_name"] = itin_name
 
-with colA:
-    itin_name = st.text_input("Tên lịch trình", value=st.session_state["itin_name"])
-    st.session_state["itin_name"] = itin_name
+# Mode selector
+mode = st.radio("Chế độ tạo lịch", ["Nhập từng cái", "Tự động tạo lịch"], horizontal=True)
 
-    start_time = st.time_input("Bắt đầu", datetime.strptime("6:00", "%H:%M").time())
-    end_time = st.time_input("Kết thúc", datetime.strptime("7:00", "%H:%M").time())
-    goal = st.text_input("Mục tiêu", value="Ăn sáng")
+# Reset schedule when switching to auto mode so timeline starts empty
+if mode == "Tự động tạo lịch" and st.session_state.get("schedule_mode") != "Tự động tạo lịch":
+    st.session_state["schedule"] = []
 
-def add_block(start, end, goal):
-    if st.session_state["schedule"]:
-        last = st.session_state["schedule"][-1]["end"]
-        if start <= last:
-            st.warning("Khung giờ mới phải sau khung giờ cuối.")
-            return
-    st.session_state["schedule"].append(
-        {"start": start, "end": end, "goal": goal, "place": None}
-    )
+st.session_state["schedule_mode"] = mode
 
-with colB:
-    if st.button("➕ Thêm khung giờ"):
-        add_block(
-            start_time.strftime("%H:%M"),
-            end_time.strftime("%H:%M"),
-            goal,
+if mode == "Nhập từng cái":
+    # Show manual filters in sidebar for manual mode
+    with st.sidebar:
+        st.divider()
+        st.subheader("Nhập mong muốn của bạn!")
+        cuisine = st.text_input("(Ăn gì/Đi chơi ở đâu/Làm gì)", value="", key="sidebar_cuisine")
+        detail_filters = {"cuisine": cuisine.strip()}
+
+        min_rating = st.slider("Rating tối thiểu", 0.0, 5.0, 0.0, 0.1, key="sidebar_rating")
+        min_reviews = 0
+
+        price_range = st.slider(
+            "Khoảng giá (₫)",
+            0,
+            2000000,
+            (0, 500000),
+            step=10000,
+            key="sidebar_price"
         )
+        fetch_price_details = False
+    
+    # Manual mode UI
+    colA, colB = st.columns([2, 1])
+    
+    with colA:
+        start_time = st.time_input("Bắt đầu", datetime.strptime("6:00", "%H:%M").time(), key="manual_start_main")
+        end_time = st.time_input("Kết thúc", datetime.strptime("7:00", "%H:%M").time(), key="manual_end_main")
+        goal = st.text_input("Mục tiêu", value="Ăn sáng", key="manual_goal_main")
 
+        def add_block(start, end, goal):
+            if st.session_state["schedule"]:
+                last = st.session_state["schedule"][-1]["end"]
+                if start <= last:
+                    st.warning("Khung giờ mới phải sau khung giờ cuối.")
+                    return
+            st.session_state["schedule"].append(
+                {"start": start, "end": end, "goal": goal, "place": None}
+            )
 
-# =======================
-# TÌM ĐỊA ĐIỂM (SERPAPI)
-# =======================
-st.subheader("🔎 Tìm địa điểm (SerpAPI)")
-origin = st.session_state.get("origin")
+    with colB:
+        if st.button("➕ Thêm khung giờ", key="btn_add_manual"):
+            add_block(
+                start_time.strftime("%H:%M"),
+                end_time.strftime("%H:%M"),
+                goal,
+            )
+    
+    # Map picker for last block
+    if st.session_state["schedule"]:
+        st.markdown("**Chọn vị trí cho khung giờ (tùy chọn)**")
+        last_block = st.session_state["schedule"][-1]
+        with st.expander(f"Chọn vị trí cho khung giờ cuối ({last_block['start']}–{last_block['end']})"):
+            default_center = st.session_state.get("search_center", st.session_state.get("origin", {}))
+            m = folium.Map(
+                location=[default_center.get("lat", 21.0278), default_center.get("lon", 105.8342)],
+                zoom_start=13
+            )
+            map_state = st_folium(m, height=300, returned_objects=["last_clicked", "center"])
+            addr_input = st.text_input("Hoặc nhập địa chỉ", value="", key="manual_addr")
+            
+            if st.button("Lấy vị trí cho khung giờ", key="btn_get_loc_manual"):
+                lat = lon = None
+                if map_state and map_state.get("last_clicked"):
+                    lat = map_state["last_clicked"]["lat"]
+                    lon = map_state["last_clicked"]["lng"]
+                elif addr_input:
+                    try:
+                        lat, lon, disp = geocode(addr_input)
+                    except Exception as e:
+                        st.error(str(e))
+                        lat = lon = None
+                
+                if lat and lon:
+                    try:
+                        disp = reverse_geocode(lat, lon)
+                    except Exception:
+                        disp = f"{lat:.5f},{lon:.5f}"
+                    
+                    last_block["place"] = {
+                        "lat": lat,
+                        "lon": lon,
+                        "name": disp,
+                        "address": disp,
+                        "rating": None,
+                        "reviews": None,
+                        "distance_km": 0,
+                        "price": None,
+                    }
+                    st.success(f"Đã đặt vị trí: {disp}")
 
-if not origin:
-    st.info("Hãy chọn vị trí gốc ở sidebar.")
-    st.stop()
 else:
-    # 🔁 Trung tâm tìm kiếm hiện tại: ưu tiên địa điểm vừa được gán vào khung giờ (nếu có)
-    # Nếu không có, dùng `search_center` (do người dùng đặt) hoặc fallback về `origin`.
-    schedule = st.session_state.get("schedule", [])
-    last_assigned_place = None
-    if schedule:
-        for blk in reversed(schedule):
-            if blk.get("place") and blk["place"].get("lat") and blk["place"].get("lon"):
-                last_assigned_place = blk["place"]
-                break
-
-    if last_assigned_place:
-        # Khi người dùng vừa gán quán vào khung giờ, dùng quán đó làm tâm tìm kiếm
-        st.session_state["search_center"] = {
-            "lat": last_assigned_place["lat"],
-            "lon": last_assigned_place["lon"],
-            "name": last_assigned_place.get("name", "Địa điểm đã chọn"),
-        }
-
-    center = st.session_state.get("search_center", origin)
-    st.write(f"**Trung tâm tìm kiếm hiện tại**: {center['name']}")
-    st.write(f"**Bán kính**: {radius_km} km")
-
-    if st.button("Tìm địa điểm"):
-        if not serpapi_key:
-            st.error("Chưa nhập SERPAPI_KEY.")
+    # Auto mode: time range + preferences
+    st.markdown("Tự động tạo 3 lịch trình: chọn khoảng thời gian và các sở thích")
+    auto_start = st.time_input("Bắt đầu", datetime.strptime("9:00", "%H:%M").time(), key="auto_start_main")
+    auto_end = st.time_input("Kết thúc", datetime.strptime("12:00", "%H:%M").time(), key="auto_end_main")
+    
+    # Dynamic preferences list
+    if "auto_prefs" not in st.session_state:
+        st.session_state["auto_prefs"] = [""]
+    
+    st.markdown("**Sở thích của bạn** (ví dụ: 'ăn sáng', 'cà phê', 'tham quan')")
+    pref_inputs = []
+    for i in range(len(st.session_state["auto_prefs"])):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            val = st.text_input(f"Sở thích #{i+1}", value=st.session_state["auto_prefs"][i], key=f"auto_pref_{i}")
+        pref_inputs.append(val)
+        with col2:
+            if st.button("✕", key=f"del_pref_{i}"):
+                st.session_state["auto_prefs"].pop(i)
+                st.rerun()
+    
+    if st.button("➕ Thêm sở thích", key="btn_add_pref"):
+        st.session_state["auto_prefs"].append("")
+        st.rerun()
+    
+    # Generate button
+    if st.button("🚀 Tạo 3 lịch trình tự động", key="btn_generate"):
+        prefs = [v.strip() for v in pref_inputs if v and v.strip()]
+        if not prefs:
+            st.warning("Vui lòng nhập ít nhất một sở thích.")
         else:
-            with st.spinner("Đang tìm trên Google Maps..."):
+            with st.spinner("Đang tạo 3 lịch trình..."):
                 try:
-                    results = search_places_serpapi(
-                        center["lat"], center["lon"], radius_km,
-                        "Ăn uống", detail_filters, serpapi_key,
-                        min_rating=min_rating, min_reviews=min_reviews, top_n=10,
-                        price_range=price_range,
-                        fetch_price_details=fetch_price_details,
+                    origin = st.session_state.get("origin", {})
+                    center = st.session_state.get("search_center", origin)
+                    schedules, note = auto_generate_schedule_variants(
+                        auto_start.strftime("%H:%M"),
+                        auto_end.strftime("%H:%M"),
+                        prefs,
+                        origin,
+                        center,
+                        radius_km,
+                        serpapi_key,
+                        ollama_base,
+                        model,
                     )
-                    st.session_state["results"] = results
-                    st.success(f"Tìm thấy {len(results)} địa điểm.")
+                    st.session_state["_auto_schedules"] = schedules
+                    st.session_state["_auto_note"] = note
                 except Exception as e:
                     st.error(str(e))
+    
+    # Display 3 variants
+    if st.session_state.get("_auto_schedules"):
+        st.divider()
+        st.markdown("### 3 Lịch trình được tạo")
+        
+        schedules = st.session_state["_auto_schedules"]
+        
+        for idx, sched in enumerate(schedules, 1):
+            st.markdown(f"**Lịch trình #{idx}**")
+            
+            # Show blocks and places
+            for blk in sched:
+                place = blk.get("place") or {}
+                st.write(f"**{blk['start']}–{blk['end']}**: {blk['goal']} — *{place.get('name', '(Không tên)')}*")
+                if place.get("address"):
+                    st.caption(f"📍 {place['address']}")
+            
+            # Map for this schedule
+            if sched:
+                with st.expander(f"Xem bản đồ lịch trình #{idx}", expanded=False):
+                    origin = st.session_state.get("origin", {})
+                    m_auto = folium.Map(
+                        location=[origin.get("lat", 21.0278), origin.get("lon", 105.8342)],
+                        zoom_start=13
+                    )
+                    
+                    # Origin marker (numbered 1)
+                    if origin:
+                        origin_icon = folium.DivIcon(
+                            html=f"""
+                            <div style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:#2ecc71;color:white;font-weight:bold;">
+                                1
+                            </div>
+                            """
+                        )
+                        folium.Marker(
+                            [origin["lat"], origin["lon"]],
+                            popup="Vị trí gốc",
+                            icon=origin_icon,
+                        ).add_to(m_auto)
+                    
+                    # Place markers and draw routes
+                    waypoints = []
+                    if origin:
+                        waypoints.append(origin)
+                    
+                    for blk in sched:
+                        if blk.get("place"):
+                            waypoints.append(blk["place"])
+                    
+                    # Draw routes between waypoints
+                    for i in range(len(waypoints) - 1):
+                        try:
+                            a = waypoints[i]
+                            b = waypoints[i + 1]
+                            geom, km, hrs = osrm_geom(a["lon"], a["lat"], b["lon"], b["lat"])
+                            coords = [(lat, lon) for lon, lat in geom["coordinates"]]
+                            folium.PolyLine(coords, weight=5, color="blue").add_to(m_auto)
+                        except Exception:
+                            pass
+                    
+                    # Place markers with numbers
+                    for i, blk in enumerate(sched, 1):
+                        place = blk.get("place", {})
+                        if place.get("lat") and place.get("lon"):
+                            stop_icon = folium.DivIcon(
+                                html=f"""
+                                <div style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:#e74c3c;color:white;font-weight:bold;">
+                                    {i + 1}
+                                </div>
+                                """
+                            )
+                            folium.Marker(
+                                [place["lat"], place["lon"]],
+                                popup=f"{i + 1}. {place.get('name', '')}",
+                                icon=stop_icon,
+                            ).add_to(m_auto)
+                    
+                    st_folium(m_auto, height=400)
+            
+            # Select button
+            if st.button(f"✅ Chọn lịch trình #{idx}", key=f"select_auto_{idx}"):
+                st.session_state["schedule"] = sched
+                st.session_state["_auto_schedules"] = None
+                st.success(f"Đã chọn lịch trình #{idx}. Bạn có thể lưu hoặc chỉnh sửa nó.")
+                st.rerun()
+            
+            st.divider()
 
 
-    # ----- MAP -----
-    m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=13)
+# =======================
+# TÌM ĐỊA ĐIỂM (SERPAPI) - MANUAL MODE ONLY
+# =======================
+if st.session_state.get("schedule_mode") == "Nhập từng cái":
+    st.subheader("🔎 Tìm địa điểm (SerpAPI)")
+    origin = st.session_state.get("origin")
 
-    # origin A (màu xanh)
-    if origin:
-        folium.Marker(
-            [origin["lat"], origin["lon"]],
-            popup="Vị trí gốc",
-            icon=folium.Icon(color="green")
-    ).add_to(m)
+    if not origin:
+        st.info("Hãy chọn vị trí gốc ở sidebar.")
+        st.stop()
+    else:
+        # 🔁 Trung tâm tìm kiếm hiện tại: ưu tiên địa điểm vừa được gán vào khung giờ (nếu có)
+        # Nếu không có, dùng `search_center` (do người dùng đặt) hoặc fallback về `origin`.
+        schedule = st.session_state.get("schedule", [])
+        last_assigned_place = None
+        if schedule:
+            for blk in reversed(schedule):
+                if blk.get("place") and blk["place"].get("lat") and blk["place"].get("lon"):
+                    last_assigned_place = blk["place"]
+                    break
+
+        if last_assigned_place:
+            # Khi người dùng vừa gán quán vào khung giờ, dùng quán đó làm tâm tìm kiếm
+            st.session_state["search_center"] = {
+                "lat": last_assigned_place["lat"],
+                "lon": last_assigned_place["lon"],
+                "name": last_assigned_place.get("name", "Địa điểm đã chọn"),
+            }
+
+        center = st.session_state.get("search_center", origin)
+        st.write(f"**Trung tâm tìm kiếm hiện tại**: {center['name']}")
+        st.write(f"**Bán kính**: {radius_km} km")
+
+        if st.button("Tìm địa điểm"):
+            if not serpapi_key:
+                st.error("Chưa nhập SERPAPI_KEY.")
+            else:
+                with st.spinner("Đang tìm trên Google Maps..."):
+                    try:
+                        results = search_places_serpapi(
+                            center["lat"], center["lon"], radius_km,
+                            "Ăn uống", detail_filters, serpapi_key,
+                            min_rating=min_rating, min_reviews=min_reviews, top_n=10,
+                            price_range=price_range,
+                            fetch_price_details=fetch_price_details,
+                        )
+                        st.session_state["results"] = results
+                        st.success(f"Tìm thấy {len(results)} địa điểm.")
+                    except Exception as e:
+                        st.error(str(e))
 
 
-    # trung tâm tìm kiếm hiện tại (có thể là B, C,...)
-    folium.Circle(
+        # ----- MAP -----
+        m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=13)
+
+        # origin A (màu xanh)
+        if origin:
+            folium.Marker(
+                [origin["lat"], origin["lon"]],
+                popup="Vị trí gốc",
+                icon=folium.Icon(color="green")
+        ).add_to(m)
+
+
+        # trung tâm tìm kiếm hiện tại (có thể là B, C,...)
+        folium.Circle(
         location=[center["lat"], center["lon"]],
         radius=radius_km * 1000,
         fill=True,
@@ -720,6 +1109,7 @@ for i, it in enumerate(st.session_state["saved_itineraries"], 1):
 # =======================
 st.subheader("⬇️ Xuất lịch trình")
 
+origin = st.session_state.get("origin")
 if origin and st.session_state["schedule"]:
     export_type = st.selectbox("Định dạng", ["JSON", "CSV", "TXT"])
     data = serialize_itinerary(st.session_state["itin_name"], origin, st.session_state["schedule"])
