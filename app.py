@@ -23,7 +23,7 @@ except Exception:
 # =======================
 st.set_page_config(page_title="Smart Tourism System ", layout="wide")
 
-DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://ukpof-34-187-181-147.a.free.pinggy.link")
+DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://vwlun-34-145-186-64.a.free.pinggy.link")
 NOMINATIM = "https://nominatim.openstreetmap.org"
 OSRM = "https://router.project-osrm.org"
 
@@ -79,16 +79,27 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
 
 
 def osrm_geom(lon1, lat1, lon2, lat2):
-    r = requests.get(
-        f"{OSRM}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}",
-        params={"overview": "full", "geometries": "geojson"},
-        headers=UA,
-        timeout=120,
-    )
-    r.raise_for_status()
-    data = r.json()
-    route = data["routes"][0]
-    return route["geometry"], route["distance"] / 1000.0, route["duration"] / 3600.0
+    url = f"{OSRM}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+    params = {"overview": "full", "geometries": "geojson"}
+
+    # Try OSRM first; on failure, fall back to straight-line geometry so UI vẫn hiển thị được
+    last_err = None
+    for _ in range(2):
+        try:
+            r = requests.get(url, params=params, headers=UA, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            route = data["routes"][0]
+            return route["geometry"], route["distance"] / 1000.0, route["duration"] / 3600.0
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0)
+
+    # Fallback: straight line using haversine distance
+    km = haversine_km(lat1, lon1, lat2, lon2)
+    hrs = km / 40.0  # giả định tốc độ 40 km/h nếu không tính được route
+    geom = {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]}
+    return geom, km, hrs
 
 # =======================
 # SerpAPI Google Maps Search
