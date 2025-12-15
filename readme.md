@@ -8,6 +8,11 @@
 - Tìm kiếm, lọc dữ liệu : **SerpApi**
 
 ## NOTE
+```bash
+Tạo tài khoản SerpApi rồi lấy key gán vào web. Hiện tại do Key SerpApi
+có giới hạn lượt sử dụng nên mỗi người muốn chạy chương trình thì tự tạo
+cho mình một Key riêng, sau khi hoàn thiện tất cả thì sẽ gán cố định một Key
+để đơn giản hóa ứng dụng.
 ```
 Tạo Key tại https://serpapi.com
 
@@ -40,38 +45,45 @@ Truy cập URL hiển thị (thường là http://localhost:8501).
 Trong Colab:
 ```bash
 Mở file model_LLM trên colab rồi tạo link pinggy, lựa chọn model bất kì.
+```
 
-## 4. DO OSRM mặc định bị lỗi nên tạo thêm OSRM riêng để chạy mượt hơn
-Yêu cầu trước khi chạy:
-Lên mạng tải Docker hình con cá voi, tải xong bật nó lên
+## 4. Trường hợp OSRM API mặc định quá tải
+- Liên kết https://router.project-osrm.org của OSRM API có khả năng bị quá tải khiến cho việc gọi chức năng vẽ đường đi từ điểm A đến điểm B tốn rất nhiều thời gian(tệ nhất là time out). để giải quyết vấn đề đó thì giải pháp sẽ là tạo một Server riêng http://localhost:5000 ngay trong máy cá nhân bằng Docker.
 
-Tạo một Folder trống.
+- Cách tạo Server riêng bằng công cụ Docker:
+```
+Bước 1: Cài đặt công cụ Docker
+```
+
+```
+Bước 2: Tạo một Folder trống.
 Bỏ file setup_osrm.py vào.
-Bật CMD lên rồi chạy: 
+Bật CMD lên và chạy lệnh bên dưới: 
     python setup_osrm.py
+```
 
-Khúc dưới cái đó tự động làm
-
-Ngồi đợi: Script sẽ tự động:
-
-Tải bản đồ Việt Nam về thư mục osrm-data.
-
-Gọi Docker để xử lý dữ liệu.
-
-Kết quả: Khi chạy xong, script sẽ in ra một dòng lệnh dài 
-(bắt đầu bằng docker run -d...). Bạn chỉ cần Copy dòng lệnh đó 
-và Paste vào terminal để server bắt đầu chạy.
-
+```
+Bước 3: Lúc này ứng dụng sẽ tự động tải những mục cần thiết
+Script sẽ tự động:
+-Tải bản đồ Việt Nam về thư mục osrm-data.
+-Gọi Docker để xử lý dữ liệu.
+-Kết quả: Khi chạy xong, script sẽ in ra một dòng lệnh dài (bắt đầu bằng docker run -d...). Bạn chỉ cần Copy dòng lệnh đó và Paste vào terminal để server bắt đầu chạy.
+```
+```
 Để test đã hoạt động hay chưa thì gõ lệnh:
     curl "http://localhost:5000/route/v1/driving/105.854444,21.028511;105.804817,21.028511?steps=true"
 Nếu hiện code OK là thành công 
 
-CÓ ẢNH CHO THẤY ĐÃ LÀM THÀNH CÔNG, CÓ GỬI KÈM.
+NOTE: NẾU KẾT QUẢ GIỐNG VỚI ẢNH Screenshot CHO THẤY ĐÃ LÀM THÀNH CÔNG
 
-Sau này muốn bật localhost thì chỉ cần bật docker(hỏi gemini).
+Sau này muốn sử dụng Server localhost OSRM thì chỉ cần bật vào docker và run mục osrm-server.
 ```
 
-## 4. Tính năng chính
+```
+- Nếu dùng OSRM mặc định thì bật line 32 và tắt line 33 trong file app.py
+- Nếu dùng Server OSRM tự tạo như trên thì bật line 33 và tắt line 33 trong file app.py
+```
+## 5. Tính năng chính
 - **Model** : gán link và tên model để sử dụng chatbot.
 - **Chọn vị trí** : chọn từ bản đồ hoặc nhập từ bàn phím(chưa biết làm GPS).
 - **Lên lịch trình** : thời gian bảo đảm tính logic.

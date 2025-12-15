@@ -29,7 +29,6 @@ NOMINATIM = "https://nominatim.openstreetmap.org"
 # =======================
 # Cấu hình OSRM
 # =======================
-
 OSRM = "https://router.project-osrm.org"
 # OSRM = "https://localhost:5000"
 
