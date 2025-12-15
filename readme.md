@@ -8,11 +8,6 @@
 - Tìm kiếm, lọc dữ liệu : **SerpApi**
 
 ## NOTE
-```bash
-Tạo tài khoản SerpApi rồi lấy key gán vào web. Hiện tại do Key SerpApi
-có giới hạn lượt sử dụng nên mỗi người muốn chạy chương trình thì tự tạo
-cho mình một Key riêng, sau khi hoàn thiện tất cả thì sẽ gán cố định một Key
-để đơn giản hóa ứng dụng.
 ```
 Tạo Key tại https://serpapi.com
 
@@ -55,7 +50,7 @@ Bỏ file setup_osrm.py vào.
 Bật CMD lên rồi chạy: 
     python setup_osrm.py
 
-Khúc dưới nó tự động làm
+Khúc dưới cái đó tự động làm
 
 Ngồi đợi: Script sẽ tự động:
 
@@ -71,7 +66,7 @@ và Paste vào terminal để server bắt đầu chạy.
     curl "http://localhost:5000/route/v1/driving/105.854444,21.028511;105.804817,21.028511?steps=true"
 Nếu hiện code OK là thành công 
 
-CÓ ẢNH CHO THẤY ĐÃ LÀM THÀNH CÔNG TAO GỬI KÈM ĐÓ.
+CÓ ẢNH CHO THẤY ĐÃ LÀM THÀNH CÔNG, CÓ GỬI KÈM.
 
 Sau này muốn bật localhost thì chỉ cần bật docker(hỏi gemini).
 ```

@@ -25,7 +25,13 @@ st.set_page_config(page_title="Smart Tourism System ", layout="wide")
 
 DEFAULT_OLLAMA_BASE = os.environ.get("OLLAMA_API_BASE", "https://tjadc-34-11-34-242.a.free.pinggy.link")
 NOMINATIM = "https://nominatim.openstreetmap.org"
+
+# =======================
+# Cấu hình OSRM
+# =======================
+
 OSRM = "https://router.project-osrm.org"
+# OSRM = "https://localhost:5000"
 
 # SerpAPI cho Google Maps search
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
